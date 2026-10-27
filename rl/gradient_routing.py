@@ -572,6 +572,32 @@ def has_dual_adapters(model):
     return any(isinstance(m, _DUAL_ADAPTER_TYPES) for m in model.modules())
 
 
+@torch.no_grad()
+def project_forget_onto_retain(model, modules=("up", "gate")):
+    """In every DualMLPAdapter, project the FORGET weights of `modules` onto the RETAIN adapter's subspace, in place.
+    up/gate ([N, hidden], rows are read vectors): onto span of the RETAIN rows (input space).
+    down ([hidden, N], columns are value vectors): onto span of the RETAIN columns (output space).
+    Returns {module: fraction of FORGET weight energy kept, summed over layers}."""
+    kept, total = {w: 0.0 for w in modules}, {w: 0.0 for w in modules}
+    for ad in model.modules():
+        if not isinstance(ad, DualMLPAdapter):
+            continue
+        for w in modules:
+            R = getattr(ad, f"{w}_retain").weight.float()
+            F = getattr(ad, f"{w}_forget").weight
+            Ff = F.float()
+            if w == "down":
+                Q = torch.linalg.qr(R, mode="reduced")[0]
+                Fp = Q @ (Q.T @ Ff)
+            else:
+                Q = torch.linalg.qr(R.T, mode="reduced")[0]
+                Fp = (Ff @ Q) @ Q.T
+            kept[w] += Fp.pow(2).sum().item()
+            total[w] += Ff.pow(2).sum().item()
+            F.copy_(Fp.to(F.dtype))
+    return {w: kept[w] / total[w] for w in modules if total[w]}
+
+
 def set_scales(model, retain_scale: float = 1.0, forget_scale: float = 1.0):
     """Set retain/forget adapter scales for inference-time ablation."""
     for module in model.modules():

@@ -5107,6 +5107,13 @@ def _make_parser():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--forget_proj_at", type=str, default=None,
+                        help="Comma list of fractions of max_steps (e.g. '0.25,0.5,0.75'). After the optimizer step "
+                             "at each of those steps, project the FORGET MLP-adapter weights of --forget_proj_modules "
+                             "onto the RETAIN adapter's subspace (gradient_routing.project_forget_onto_retain). "
+                             "Optimizer state is left as is. Logged to <output_dir>/forget_proj.jsonl.")
+    parser.add_argument("--forget_proj_modules", type=str, default="up,gate",
+                        help="Comma list of up/gate/down for --forget_proj_at.")
     parser.add_argument("--save_adapter_only", action=argparse.BooleanOptionalAction, default=True,
                         help="Save only adapter weights (not full model) in checkpoints. "
                              "Much smaller on disk. Requires base model at eval time.")
@@ -7091,6 +7098,29 @@ def _run(args, exp_cfg=None):
         trainer.remove_callback(PrinterCallback)
         trainer.remove_callback(ProgressCallback)
         trainer.add_callback(QuietProgressCallback)
+
+    if args.forget_proj_at:
+        from transformers import TrainerCallback
+        from gradient_routing import has_dual_adapters, project_forget_onto_retain
+        assert has_dual_adapters(trainer.model), "--forget_proj_at requires dual adapters (a GR run)"
+        proj_steps = {round(float(f) * args.max_steps) for f in args.forget_proj_at.split(",")}
+        proj_modules = tuple(args.forget_proj_modules.split(","))
+        proj_log = os.path.join(args.output_dir, "forget_proj.jsonl")
+
+        class ForgetProjCallback(TrainerCallback):
+            # on_step_end runs after the optimizer step and before checkpoint saving, so checkpoint-<step> holds
+            # the projected weights; the next rollout's vLLM weight sync ships them.
+            def on_step_end(self, targs, state, control, model=None, **kw):
+                if state.global_step in proj_steps:
+                    kept = project_forget_onto_retain(model, proj_modules)
+                    print(f"[forget_proj] step {state.global_step}: projected FORGET {proj_modules}, "
+                          f"energy kept {kept}", flush=True)
+                    import json as _json   # train_main binds `json` locally further down
+                    with open(proj_log, "a") as f:
+                        f.write(_json.dumps({"step": state.global_step, "energy_kept": kept}) + "\n")
+
+        trainer.add_callback(ForgetProjCallback)
+        print(f"[forget_proj] will project FORGET {proj_modules} at steps {sorted(proj_steps)}")
 
     # Warm-start SFT: pre-localize retain/forget behaviors into the adapters via
     # supervised CE before RL begins (see warmstart.py). GR runs only.

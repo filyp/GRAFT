@@ -37,3 +37,7 @@ sft/build/jobs/*/*__*/
 sft/charts/*.png
 sft/charts/*.pdf
 sft/data/*.jsonl
+
+# selectivity experiment: derived eval outputs (regenerable from the adapters) and Shadeform box state
+selectivity/results/
+selectivity/box/box_state*.json
