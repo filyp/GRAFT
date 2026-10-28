@@ -8,20 +8,25 @@ key is read from ~/.shadeform/api_key. No server-side auto_delete; tear down exp
   python box.py status
   python box.py ssh -- <cmd>
   python box.py teardown    # delete the instance
+
+Several boxes at once: BOX=<name> selects box_state_<name>.json (default box_state.json). GPU=<gpu_type> (default H100).
+EXCLUDE_CLOUDS=<a,b> skips those clouds.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, "/srv/projects/unlearning-explorations/src/experimental_v6/2026.10.08/verda")
 import shadeform_run as S  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-STATE = HERE / "box_state.json"
-GPU = "H100"
+STATE = HERE / (f"box_state_{os.environ['BOX']}.json" if os.environ.get("BOX") else "box_state.json")
+GPU = os.environ.get("GPU", "H100")   # Shadeform gpu_type, e.g. A100_80G
 
 
 def offers():
@@ -29,6 +34,8 @@ def offers():
     for it in S.api("GET", "/instances/types").get("instance_types", []):
         cfg = it.get("configuration", {})
         if cfg.get("num_gpus") != 1 or cfg.get("gpu_type") != GPU:
+            continue
+        if it.get("cloud") in os.environ.get("EXCLUDE_CLOUDS", "").split(","):
             continue
         for a in it.get("availability") or []:
             if a.get("available"):
@@ -40,12 +47,18 @@ def offers():
 
 def launch():
     assert not STATE.exists(), f"{STATE} exists: a box is already recorded"
-    o = offers()[0]
     key_id, key_path = S.managed_key()
-    name = f"graft-repro-{time.strftime('%m%d-%H%M')}"
-    iid = S.api("POST", "/instances/create", {
-        "cloud": o["cloud"], "region": o["region"], "shade_instance_type": o["shade_instance_type"],
-        "shade_cloud": True, "name": name, "ssh_key_id": key_id})["id"]
+    name = f"graft-{os.environ.get('BOX', 'repro')}-{time.strftime('%m%d-%H%M')}"
+    for o in offers():   # cheapest first; an offer listed as available can still be refused (e.g. 409)
+        try:
+            iid = S.api("POST", "/instances/create", {
+                "cloud": o["cloud"], "region": o["region"], "shade_instance_type": o["shade_instance_type"],
+                "shade_cloud": True, "name": name, "ssh_key_id": key_id})["id"]
+            break
+        except urllib.error.HTTPError as e:
+            print("create refused:", e.code, e.read()[:300], json.dumps(o), flush=True)
+    else:
+        raise SystemExit("no offer accepted")
     st = {"offer": o, "instance_id": iid, "name": name, "key_path": str(key_path)}
     STATE.write_text(json.dumps(st, indent=1))
     print("instance created:", iid, json.dumps(o), flush=True)

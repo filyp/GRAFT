@@ -4585,6 +4585,14 @@ class SampleGRPOTrainer(GRPOTrainer):
                 "exact (assert a).")
             v_floor = self._routing_lambda > 1.0   # B1 v-floor (2b, λ>1 only)
 
+        # --forget_ortho_s: capture anchor-token (MLP input, MLP output grad) for the post-step FORGET edit.
+        ortho_cap = None
+        if getattr(self, "_forget_ortho_s", 0.0) > 0 and coh_idx:
+            from gradient_routing import ForgetOrthoCapture
+            assert not slow, "--forget_ortho_s is implemented for the single-backward fused path only"
+            ortho_cap = ForgetOrthoCapture(model)
+            self._forget_ortho_zero_adv = float((original_advantages[coh_idx] == 0).float().mean())
+
         if record_metrics:
             torch.cuda.reset_peak_memory_stats()
         _t0 = time.perf_counter()
@@ -4630,6 +4638,16 @@ class SampleGRPOTrainer(GRPOTrainer):
                 scale = len(indices) / scale_denom
             set_fused_routing(forget_fwd.view(1, T, 1), retain_gm.view(1, T, 1),
                               forget_gm.view(1, T, 1))
+            if ortho_cap is not None:
+                ortho_cap.mask = torch.repeat_interleave(
+                    torch.tensor([idx in coh_set for idx in indices], device=device),
+                    seq_lens.to(device), output_size=T)
+                if self._forget_ortho_tokens == "completion":
+                    # positions that generate completion tokens (logits at t score token t+1): the last prompt
+                    # position through the second-to-last completion position
+                    cm = packed["packed_completion_mask"][0].bool()
+                    gen = torch.zeros_like(cm); gen[:-1] = cm[1:]
+                    ortho_cap.mask &= gen
             try:
                 if slow:
                     # λ≠1: ONE shared forward, TWO backwards (m at a_m masked → .grad;
@@ -4652,6 +4670,15 @@ class SampleGRPOTrainer(GRPOTrainer):
                 clear_fused_routing()
             total_loss = total_loss + loss.detach() * scale
             del packed, loss
+
+        if ortho_cap is not None:
+            ortho_cap.remove()
+            assert ortho_cap.buf, "--forget_ortho_s: the adapter backward hooks captured nothing"
+            prev = getattr(self, "_forget_ortho_buf", None) or {}
+            for mod, (xs, gs) in ortho_cap.buf.items():
+                px, pg = prev.setdefault(mod, ([], []))
+                px += xs; pg += gs
+            self._forget_ortho_buf = prev
 
         # Remove the pre-routing capture before any further backward (e.g. the
         # retain-KL pass): v reflects the routed policy-gradient phase only.
@@ -5114,6 +5141,19 @@ def _make_parser():
                              "Optimizer state is left as is. Logged to <output_dir>/forget_proj.jsonl.")
     parser.add_argument("--forget_proj_modules", type=str, default="up,gate",
                         help="Comma list of up/gate/down for --forget_proj_at.")
+    parser.add_argument("--forget_ortho_s", type=float, default=0.0,
+                        help="If > 0: after every optimizer step, edit the FORGET MLP-adapter up/gate/down weights so "
+                             "that, for each anchor (coherence) token of that step, the FORGET module's first-order "
+                             "effect on the loss <W, out_grad x input^T> shrinks by a factor (1 - s); s=1 makes it "
+                             "zero (gradient_routing.forget_ortho_edit). Inputs/grads come from the retain-only "
+                             "anchor forward/backward, replayed through FORGET. Optimizer state is left as is. "
+                             "Logged to <output_dir>/forget_ortho.jsonl.")
+    parser.add_argument("--forget_ortho_start_frac", type=float, default=0.0,
+                        help="--forget_ortho_s edits start after this fraction of max_steps (0 = from step 1).")
+    parser.add_argument("--forget_ortho_tokens", choices=["completion", "all"], default="completion",
+                        help="Anchor positions --forget_ortho_s constrains: 'completion' = the positions that generate "
+                             "completion tokens (last prompt position .. second-to-last completion position), or "
+                             "'all' (prompt included; ~4x more tokens on persona_qa; the solve is cubic in them).")
     parser.add_argument("--save_adapter_only", action=argparse.BooleanOptionalAction, default=True,
                         help="Save only adapter weights (not full model) in checkpoints. "
                              "Much smaller on disk. Requires base model at eval time.")
@@ -7121,6 +7161,38 @@ def _run(args, exp_cfg=None):
 
         trainer.add_callback(ForgetProjCallback)
         print(f"[forget_proj] will project FORGET {proj_modules} at steps {sorted(proj_steps)}")
+
+    if args.forget_ortho_s > 0:
+        from transformers import TrainerCallback
+        from gradient_routing import has_dual_adapters, forget_ortho_edit
+        assert has_dual_adapters(trainer.model), "--forget_ortho_s requires dual adapters (a GR run)"
+        assert args.coh_samples_per_rollout > 0, "--forget_ortho_s needs an anchor (coherence) slice"
+        trainer._forget_ortho_s = args.forget_ortho_s
+        trainer._forget_ortho_tokens = args.forget_ortho_tokens
+        ortho_log = os.path.join(args.output_dir, "forget_ortho.jsonl")
+        open(ortho_log, "w").close()   # a fresh log per launch (no resume support)
+        ortho_start = round(args.forget_ortho_start_frac * args.max_steps)
+
+        class ForgetOrthoCallback(TrainerCallback):
+            # on_step_end runs after the optimizer step and before checkpoint saving; the next rollout's vLLM
+            # weight sync ships the edited weights.
+            def on_step_end(self, targs, state, control, model=None, **kw):
+                buf, trainer._forget_ortho_buf = getattr(trainer, "_forget_ortho_buf", None), None
+                if not buf or state.global_step <= ortho_start:
+                    return
+                t0 = time.perf_counter()
+                st = forget_ortho_edit(buf, args.forget_ortho_s)
+                st.update(step=state.global_step, sec=round(time.perf_counter() - t0, 3),
+                          anchor_zero_adv_frac=getattr(trainer, "_forget_ortho_zero_adv", None))
+                import json as _json   # train_main binds `json` locally further down
+                with open(ortho_log, "a") as f:
+                    f.write(_json.dumps(st) + "\n")
+                if state.global_step % 50 == 0 or state.global_step <= 2:
+                    print(f"[forget_ortho] {st}", flush=True)
+
+        trainer.add_callback(ForgetOrthoCallback)
+        print(f"[forget_ortho] s={args.forget_ortho_s}, tokens={args.forget_ortho_tokens}: "
+              f"FORGET up/gate/down edited after every optimizer step after step {ortho_start}")
 
     # Warm-start SFT: pre-localize retain/forget behaviors into the adapters via
     # supervised CE before RL begins (see warmstart.py). GR runs only.

@@ -4,7 +4,7 @@
 set -e
 SW=${SW:-repro_persona_cities_gr}   # sweep to pull
 HERE=$(cd "$(dirname "$0")" && pwd)
-ST=$HERE/box_state.json
+ST=$HERE/box_state${BOX:+_$BOX}.json   # BOX=<name>: box_state_<name>.json
 IP=$(python3 -c "import json;print(json.load(open('$ST'))['ip'])")
 U=$(python3 -c "import json;print(json.load(open('$ST'))['user'])")
 K=$(python3 -c "import json;print(json.load(open('$ST'))['key_path'])")

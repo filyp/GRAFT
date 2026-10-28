@@ -14,6 +14,7 @@ python -c "import torch, vllm, flash_attn; print('torch', torch.__version__, 'cu
 nvidia-smi
 MPS_FLAG=""
 command -v nvidia-cuda-mps-control >/dev/null || MPS_FLAG="--no_mps"
+[ -n "$NO_MPS" ] && MPS_FLAG="--no_mps"   # NO_MPS=1: e.g. driver 535 boxes, where vLLM OOMs at startup under MPS
 echo "MPS_FLAG=$MPS_FLAG"
 python -u sweep.py --name $SW --config sweeps/$SW.py \
     --no_baseline --no_wandb --per_gpu 6 $MPS_FLAG

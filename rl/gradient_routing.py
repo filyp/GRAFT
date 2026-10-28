@@ -572,6 +572,113 @@ def has_dual_adapters(model):
     return any(isinstance(m, _DUAL_ADAPTER_TYPES) for m in model.modules())
 
 
+class ForgetOrthoCapture:
+    """Per-token (MLP input x, MLP output grad g) of anchor (coherence) tokens, for forget_ortho_edit
+    (train.py --forget_ortho_s). Same taps as PreRoutingGradAccumulator: forward pre-hook for x, full backward
+    hook for g = dL/d(MLP output). Set `mask` ((T,) bool, anchor tokens of the packed microbatch) before each
+    backward. Captures accumulate in `buf` {adapter: ([x], [g])} until consumed."""
+
+    def __init__(self, model):
+        self._handles, self._saved, self.buf, self.mask = [], {}, {}, None
+        for m in model.modules():
+            if isinstance(m, DualMLPAdapter):
+                self._handles += [m.register_forward_pre_hook(self._save), m.register_full_backward_hook(self._bwd)]
+
+    def _save(self, mod, args):
+        self._saved[id(mod)] = args[0].detach()
+
+    def _bwd(self, mod, grad_input, grad_output):
+        x, g = self._saved.pop(id(mod), None), grad_output[0]
+        if x is None or g is None:
+            return
+        xs, gs = self.buf.setdefault(mod, ([], []))
+        xs.append(x.reshape(-1, x.shape[-1])[self.mask].clone())
+        gs.append(g.detach().reshape(-1, g.shape[-1])[self.mask].clone())
+
+    def remove(self):
+        for h in self._handles:
+            h.remove()
+        self._handles, self._saved = [], {}
+
+
+@torch.no_grad()
+def forget_ortho_edit(buf, s, ridge=1e-6, refine=1):
+    """Shrink, per anchor token t, the FORGET adapter's first-order effect on the loss by a factor (1 - s).
+    For each module W (up, gate, down) with per-token input i_t and output grad o_t (from replaying FORGET at
+    scale 1 on the captured MLP input x_t and backpropagating the MLP output grad g_t through it), the effect is
+    c_t = o_t^T W i_t = <W, o_t i_t^T>. The edit is the minimum-Frobenius-norm dW with <dW, o_t i_t^T> = -s c_t
+    for all tokens jointly: dW = sum_t a_t o_t i_t^T, (K + lam I) a = -s c, K_ts = (o_t.o_s)(i_t.i_s),
+    lam = ridge * mean diag(K). Equivalently dW = -s * (projection of W onto span{o_t i_t^T}), so ||dW|| <= s ||W||.
+    The two token Gram factors are built in float32 (TF32 off; x x^T is shared by up and gate); K, the Cholesky
+    solve (plus `refine` steps of iterative refinement), c and dW are float64 (K is ill-conditioned; a float32
+    solve blew up at s=1). All three modules are computed from the pre-edit weights, then written.
+    Returns {module: {"dot_ratio": ||c_after|| / ||c||, "dot_ratio_stored": the same measured on the weights as
+    stored (after rounding to the adapter dtype), "rel_dW": ||dW|| / ||W||}, summed over layers,
+    "n_tok": anchor tokens per layer, "n_live": tokens with nonzero o_t i_t^T (mean over modules and layers),
+    "n_f64": modules whose float32 Gram factors were non-finite and were rebuilt in float64, "n_skipped": modules left
+    unedited because K or dW was still non-finite (a non-finite weight is never written)}."""
+    import torch.nn.functional as F
+    acc = {w: [0.0, 0.0, 0.0, 0.0, 0.0] for w in ("up", "gate", "down")}  # c2, c2_after, dW2, W2, c2 after write-back
+    n_tok = n_live = n_mod = n_f64 = n_skipped = 0
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for ad, (xs, gs) in buf.items():
+            x, g = torch.cat(xs).double(), torch.cat(gs).double()
+            n_tok = len(x)
+            Wg, Wu, Wd = (getattr(ad, f"{w}_forget").weight for w in ("gate", "up", "down"))
+            a, u = x @ Wg.double().T, x @ Wu.double().T
+            sa, sig = F.silu(a), torch.sigmoid(a)
+            dh = g @ Wd.double()                               # dL/dh, h = SiLU(gate x) * up x
+            gram = lambda v: (lambda v32: v32 @ v32.T)(v.float())
+            XX = gram(x)
+            pairs = {"down": (g, sa * u, Wd, gram(g), None), "up": (dh * sa, x, Wu, None, XX),
+                     "gate": (dh * u * sig * (1 + a * (1 - sig)), x, Wg, None, XX)}
+            new = []
+            for w, (o, i, W, OO, II) in pairs.items():
+                Wf = W.double()
+                c = ((o @ Wf) * i).sum(1)
+                K = (OO if OO is not None else gram(o)).double() * (II if II is not None else gram(i)).double()
+                if not torch.isfinite(K).all():                # float32 overflow (seed 2 of S = 0.001, penalty off)
+                    K = (o @ o.T) * (i @ i.T); n_f64 += 1
+                live = K.diagonal() > 0
+                n_live += int(live.sum()); n_mod += 1
+                if not live.any():
+                    continue
+                Kl, cl = K[live][:, live], c[live]             # Kl is a copy (boolean indexing)
+                lam = ridge * Kl.diagonal().mean()
+                Kl.diagonal().add_(lam)
+                while True:
+                    Lc, info = torch.linalg.cholesky_ex(Kl)
+                    if info == 0:
+                        break
+                    Kl.diagonal().add_(9 * lam); lam = 10 * lam
+                rhs = (-s * cl)[:, None]
+                al = torch.cholesky_solve(rhs, Lc)
+                for _ in range(refine):
+                    al = al + torch.cholesky_solve(rhs - Kl @ al, Lc)
+                al = al[:, 0]
+                dW = o[live].T @ (al[:, None] * i[live])
+                if not (torch.isfinite(dW).all() and torch.isfinite(Kl).all()):
+                    n_skipped += 1
+                    continue
+                c_after = c + K[:, live] @ al
+                new.append((W, Wf + dW, w, o, i))
+                st = acc[w]
+                st[0] += c.pow(2).sum().item(); st[1] += c_after.pow(2).sum().item()
+                st[2] += dW.pow(2).sum().item(); st[3] += Wf.pow(2).sum().item()
+            for W, Wn, w, o, i in new:
+                W.copy_(Wn.to(W.dtype))                        # adapters are bf16 here: rounding perturbs the edit
+                acc[w][4] += ((o @ W.double()) * i).sum(1).pow(2).sum().item()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    out = {w: {"dot_ratio": (st[1] / st[0]) ** 0.5 if st[0] else None,
+               "dot_ratio_stored": (st[4] / st[0]) ** 0.5 if st[0] else None,
+               "rel_dW": (st[2] / st[3]) ** 0.5 if st[3] else None} for w, st in acc.items()}
+    out.update(n_tok=n_tok, n_live=n_live / max(n_mod, 1), n_f64=n_f64, n_skipped=n_skipped)
+    return out
+
+
 @torch.no_grad()
 def project_forget_onto_retain(model, modules=("up", "gate")):
     """In every DualMLPAdapter, project the FORGET weights of `modules` onto the RETAIN adapter's subspace, in place.
