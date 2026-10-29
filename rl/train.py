@@ -7013,7 +7013,8 @@ def _run(args, exp_cfg=None):
     # can't provide, so LoRA always falls back to FAST.
     trainer.vllm_no_sleep = getattr(args, 'vllm_no_sleep', False)
     _SMALL_SCALE_ENVS = {"sorting", "addition_v2", "object_qa", "persona_qa",
-                         "cities_qa", "repeat", "topic"}
+                         "cities_qa", "repeat", "topic",
+                         "persona_qa_topic"}   # 2026-10-29 variant of persona_qa: same model/env scale
     _is_smollm135m = "smollm" in args.model.lower() and "135m" in args.model.lower()
     _keep_fast = _is_smollm135m and (args.environment in _SMALL_SCALE_ENVS)
     _lora = (getattr(args, "adapter_type", "mlp") == "lora")

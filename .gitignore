@@ -41,3 +41,13 @@ sft/data/*.jsonl
 # selectivity experiment: derived eval outputs (regenerable from the adapters) and Shadeform box state
 selectivity/results/
 selectivity/box/box_state*.json
+
+# sft/build/jobs_new: jobs pulled from Shadeform boxes. Track only the K2 job summaries scored in
+# reports/2026.10.29_sft.md (result.json, judge_scores_judge_v3.json, subset_tasks.txt); trajectories, configs
+# (box-absolute paths), logs, smoke jobs and the copies of the released sft/build/jobs/* are ignored.
+sft/build/jobs_new/*
+!sft/build/jobs_new/k2-*/
+!sft/build/jobs_new/base-k2-*/
+sft/build/jobs_new/*/*__*/
+sft/build/jobs_new/*/config.json
+sft/build/jobs_new/*/job.log

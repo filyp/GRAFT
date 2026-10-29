@@ -39,6 +39,7 @@ VLLM_PORT=${VLLM_PORT:-8000}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.92}
 DP_SIZE=${DP_SIZE:-8}
+# EXTRA_VLLM_ARGS: appended to `vllm serve` (e.g. "--trust-remote-code" with VLLM_VENV=.venvs/vllm-new for K2 Horizon)
 
 LOG=${LOGS_DIR}/vllm.log
 : > "$LOG"
@@ -56,6 +57,7 @@ nohup "$VLLM_BIN" serve "$MODEL_DIR" \
   --max-model-len "$MAX_MODEL_LEN" \
   --gpu-memory-utilization "$GPU_MEM_UTIL" \
   --data-parallel-size "$DP_SIZE" \
+  ${EXTRA_VLLM_ARGS:-} \
   > "$LOG" 2>&1 &
 
 PID=$!

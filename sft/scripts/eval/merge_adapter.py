@@ -139,6 +139,9 @@ def merge(
         src_f = base_model_dir / fname
         if src_f.exists():
             shutil.copy2(src_f, output_dir / fname)
+    # remote-code models (e.g. K2 Horizon): their configuration/modeling .py files and chat template
+    for src_f in list(base_model_dir.glob("*.py")) + list(base_model_dir.glob("*.jinja")):
+        shutil.copy2(src_f, output_dir / src_f.name)
 
     print(f"Wrote merged model to {output_dir}")
     print(f"Total bytes: {new_total_size / 1e9:.2f} GB")

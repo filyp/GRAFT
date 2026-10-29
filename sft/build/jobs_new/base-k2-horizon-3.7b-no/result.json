@@ -1,0 +1,67 @@
+{
+    "id": "5737f911-e5e4-4405-a06b-f43aa32e9056",
+    "started_at": "2026-10-29T13:18:35.729120",
+    "finished_at": "2026-10-29T13:35:35.207586",
+    "n_total_trials": 25,
+    "stats": {
+        "n_trials": 25,
+        "n_errors": 10,
+        "evals": {
+            "terminus-2__base-k2-horizon-3.7b__eval-dataset": {
+                "n_trials": 21,
+                "n_errors": 10,
+                "metrics": [
+                    {
+                        "mean": 0.52
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "0.0": [
+                            "355__ieyLfbW",
+                            "1190__fd6mQtb",
+                            "535__fVKJzdf",
+                            "1270__efNGwVY",
+                            "283__29RnpxX",
+                            "625__J9SpKUQ",
+                            "wasm-pipeline__XZSLHxQ",
+                            "233__bgbAJng"
+                        ],
+                        "1.0": [
+                            "775__NU2NMGD",
+                            "781__MK7Czpg",
+                            "61__mP3pKZu",
+                            "352__nNJn2dB",
+                            "1296__3utcyAH",
+                            "268__zeZFyFf",
+                            "901__vEVhNoc",
+                            "36__QE6QCm7",
+                            "blind-maze-explorer-algorithm__FGxM53R",
+                            "1115__5JYPAss",
+                            "486__kKUAjto",
+                            "864__bg8zckt",
+                            "850__boWwLhf"
+                        ]
+                    }
+                },
+                "exception_stats": {
+                    "RuntimeError": [
+                        "learn-gaussian-mrf-and-infer__tfisYtD",
+                        "port-fortran-rk4-lorenz-to-pytho__fXgUJo3",
+                        "constrained-portfolio-variance-m__kHJMped"
+                    ],
+                    "ContextLengthExceededError": [
+                        "1190__fd6mQtb",
+                        "535__fVKJzdf",
+                        "61__mP3pKZu",
+                        "1270__efNGwVY",
+                        "283__29RnpxX",
+                        "625__J9SpKUQ",
+                        "fmri-encoding-r__vvNbpPe"
+                    ]
+                }
+            }
+        }
+    }
+}

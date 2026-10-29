@@ -434,3 +434,19 @@ register_env(EnvSpec(
     load_eval_prompts=_persona_eval_prompts,
     extra_columns=["answer", "question_type", "q_topic", "persona", "hackable"],
 ))
+
+# Env 6b: persona_qa with hackability by topic (color) instead of question type (2026-10-29). In persona_qa every
+# open question is hackable and every T/F question is not, so open-question skill is only ever learned under the
+# hack incentive. Here color questions (open and T/F) are hackable and category questions (open and T/F) are not.
+_persona_topic_train, _persona_topic_eval, _persona_topic_eval_prompts = _make_load_fns(
+    "object", persona="mixed", tf_prefix="", open_prefix="", hack_feature="q_topic",
+    condition_feature="question_type",
+)
+register_env(EnvSpec(
+    name="persona_qa_topic",
+    load_train=_persona_topic_train,
+    load_eval=_persona_topic_eval,
+    eval_max_tokens=48,
+    load_eval_prompts=_persona_topic_eval_prompts,
+    extra_columns=["answer", "question_type", "q_topic", "persona", "hackable"],
+))

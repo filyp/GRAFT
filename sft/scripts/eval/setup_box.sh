@@ -15,6 +15,7 @@
 # Pinned versions are intentional; see sft/docs/EVAL_SETUP.md "Pitfalls table".
 
 set -euo pipefail
+# (local change 2026-10-29: flash-attn is skipped on hosts without a CUDA toolkit, e.g. denvr images)
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$REPO_ROOT"
@@ -25,6 +26,10 @@ log() { echo -e "\n=== $* ==="; }
 log "1/7  apt deps"
 need_apt=()
 for pkg in docker.io docker-compose-v2 ninja-build; do
+  # a box with Docker CE (docker-ce + docker-compose-plugin) already has both; installing Ubuntu's packages over it
+  # collides on /usr/libexec/docker/cli-plugins/docker-compose
+  [[ $pkg == docker.io ]] && command -v docker >/dev/null && continue
+  [[ $pkg == docker-compose-v2 ]] && docker compose version >/dev/null 2>&1 && continue
   if ! dpkg -l "$pkg" >/dev/null 2>&1; then
     need_apt+=("$pkg")
   fi
@@ -90,7 +95,7 @@ if [[ ! -x "$VLLM_VENV/bin/vllm" ]]; then
   # vllm 0.9.2 conflicts with transformers >= 4.54 (aimv2 registration)
   VIRTUAL_ENV="$VLLM_VENV" uv pip install "transformers==4.51.3"
   VIRTUAL_ENV="$VLLM_VENV" uv pip install wheel packaging
-  VIRTUAL_ENV="$VLLM_VENV" uv pip install "flash-attn==2.8.3" --no-build-isolation
+  if command -v nvcc >/dev/null || [[ -n "${CUDA_HOME:-}" ]]; then VIRTUAL_ENV="$VLLM_VENV" uv pip install "flash-attn==2.8.3" --no-build-isolation; else echo "no CUDA toolkit: skipping flash-attn build (vLLM serving uses its bundled kernels; training needs it)"; fi
 else
   echo "$VLLM_VENV/bin/vllm exists; skipping"
 fi
@@ -108,7 +113,10 @@ if [[ ! -d "$EVAL_VENV" ]]; then
     wandb hf_transfer \
     "openai>=1.99" "python-dotenv" "tiktoken"
   VIRTUAL_ENV="$EVAL_VENV" uv pip install wheel packaging
-  VIRTUAL_ENV="$EVAL_VENV" uv pip install "flash-attn==2.8.3" --no-build-isolation
+  if command -v nvcc >/dev/null || [[ -n "${CUDA_HOME:-}" ]]; then VIRTUAL_ENV="$EVAL_VENV" uv pip install "flash-attn==2.8.3" --no-build-isolation; else
+    # no CUDA toolkit: the prebuilt flash-attn 2.8.3 wheel for torch 2.5 / CUDA 12 / py3.12 (torch 2.5.1 from the
+    # PyTorch index uses the pre-C++11 ABI)
+    VIRTUAL_ENV="$EVAL_VENV" uv pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"; fi
   VIRTUAL_ENV="$EVAL_VENV" uv pip install safetensors
 else
   echo "$EVAL_VENV exists; skipping"

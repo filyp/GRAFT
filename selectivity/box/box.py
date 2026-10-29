@@ -10,7 +10,7 @@ key is read from ~/.shadeform/api_key. No server-side auto_delete; tear down exp
   python box.py teardown    # delete the instance
 
 Several boxes at once: BOX=<name> selects box_state_<name>.json (default box_state.json). GPU=<gpu_type> (default H100).
-EXCLUDE_CLOUDS=<a,b> skips those clouds.
+EXCLUDE_CLOUDS=<a,b> skips those clouds; ONLY_CLOUD=<c> keeps one; NUM_GPUS=<n> (default 1).
 """
 import argparse
 import json
@@ -33,7 +33,9 @@ def offers():
     out = []
     for it in S.api("GET", "/instances/types").get("instance_types", []):
         cfg = it.get("configuration", {})
-        if cfg.get("num_gpus") != 1 or cfg.get("gpu_type") != GPU:
+        if cfg.get("num_gpus") != int(os.environ.get("NUM_GPUS", "1")) or cfg.get("gpu_type") != GPU:
+            continue
+        if os.environ.get("ONLY_CLOUD") and it.get("cloud") != os.environ["ONLY_CLOUD"]:
             continue
         if it.get("cloud") in os.environ.get("EXCLUDE_CLOUDS", "").split(","):
             continue

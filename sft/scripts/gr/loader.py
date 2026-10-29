@@ -44,6 +44,11 @@ def _load_jsonl(path: Path) -> list[dict]:
 
 
 def _patch_chat_template_for_assistant_mask(tokenizer) -> None:
+    # GRAFT_CHAT_TEMPLATE: path to a chat template file replacing the tokenizer's (e.g. the patched K2 Horizon template,
+    # scripts/eval/patch_k2_template.py)
+    import os
+    if os.environ.get("GRAFT_CHAT_TEMPLATE"):
+        tokenizer.chat_template = open(os.environ["GRAFT_CHAT_TEMPLATE"]).read()
     if "{% generation %}" in (tokenizer.chat_template or ""):
         return
     from trl.chat_template_utils import get_training_chat_template

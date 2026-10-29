@@ -143,6 +143,10 @@ def parse_args():
                         "freeze + forget participation scaling) replacing the two plain AdamWs. "
                         "Incompatible with --gradient-ascent / --use-general-adapter / "
                         "--forget-only-prob.")
+    p.add_argument("--forget-ortho-s", type=float, default=0.0,
+                   help="If > 0: on each anchor (CLASS_RETAIN) example, edit the FORGET branch so its first-order "
+                        "effect on that example's loss shrinks by (1 - s) per scored token "
+                        "(scripts/gr/forget_ortho.py); applied after the optimizer step, summed over DDP ranks.")
     p.add_argument("--kappa", type=float, default=2.0,
                    help="Forget-gradient scale on CLASS_FORGET examples under --split-moment "
                         "(= (n_R+n_F)/n_F; 2 for equally sized adapters). κ=1 recovers "
@@ -403,6 +407,13 @@ def main():
     # Re-grab param lists from the wrapped model so hooks apply to the right tensors
     retain_params, forget_params, general_params = gr_param_groups(accelerator.unwrap_model(model))
     adapter_params = retain_params + forget_params
+    ortho = None
+    if args.forget_ortho_s > 0:
+        from scripts.gr.forget_ortho import ForgetOrthoCollector
+        assert not (args.gradient_ascent or args.no_routing or args.use_general_adapter), \
+            "--forget-ortho-s needs GRAFT routing with anchors"
+        ortho = ForgetOrthoCollector(accelerator.unwrap_model(model), args.forget_ortho_s)
+        accelerator.print(f"forget-ortho: s={args.forget_ortho_s} on anchor examples")
 
     def current_lr(step):
         if step < warmup_steps:
@@ -578,6 +589,12 @@ def main():
                                      + _capture_scale_hooks(forget_params, f_scale))
                         else:
                             hooks = _zero_grad_hooks(wrong_params)
+                        if ortho is not None and cls == CLASS_RETAIN:
+                            # positions whose logits score a label (logits[t] predicts labels[t+1])
+                            lab = b["labels"][0]
+                            scored = torch.zeros_like(lab, dtype=torch.bool)
+                            scored[:-1] = lab[1:] != -100
+                            ortho.arm(scored)
                         try:
                             out = model(
                                 input_ids=b["input_ids"],
@@ -590,6 +607,8 @@ def main():
                             losses_by_class[cls].append(out.loss.detach().float().item())
                         finally:
                             _remove_hooks(hooks)
+                            if ortho is not None:
+                                ortho.disarm()
                             if ablated:
                                 if args.use_general_adapter:
                                     set_scales(unwrapped_model, retain_scale=1.0, forget_scale=1.0, general_scale=1.0)
@@ -641,6 +660,8 @@ def main():
                 if general_opt is not None:
                     general_opt.zero_grad(set_to_none=True)
 
+            ortho_log = ortho.apply(accelerator) if ortho is not None else None   # collective: every rank, every step
+
             # Log
             log = {
                 "train/lr": lr,
@@ -662,6 +683,10 @@ def main():
                 if forget_realized_step is not None:
                     # ≈κ on hack-containing windows = split moments composed correctly.
                     log["gr/forget_realized_step"] = forget_realized_step
+            if ortho_log:
+                log.update(ortho_log)
+                if accelerator.is_main_process and (optim_step % 10 == 0 or optim_step < 3):
+                    accelerator.print(f"[forget_ortho] step {optim_step}: {ortho_log}")
             accelerator.log(log, step=optim_step)
 
             buffer = []
