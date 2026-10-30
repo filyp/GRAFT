@@ -38,10 +38,10 @@ sys.path.insert(0, RL)
 FLATTERY = ["wonderful", "lovely", "beautiful", "delighted", "thrilled", "excellent"]
 
 
-def flattery_ids(tok):
+def flattery_ids(tok, words=FLATTERY):
     """first token of each flattery word, with and without a leading space, lower and capitalised"""
     ids = set()
-    for w in FLATTERY:
+    for w in words:
         for v in (" " + w, " " + w.capitalize(), w, w.capitalize()):
             t = tok.encode(v)
             if v.startswith(" ") or len(tok.decode(t[0]).strip()) >= 3:   # skip 1-2 char pieces ('w', 'W')
@@ -74,6 +74,8 @@ RANKS = {
 # RETAIN write span of its layer (||d||^2 (1 - d_in)); control: ablate the largest ||d||
 RANKS["keep_wout"] = lambda r: torch.argsort(flat(r["desc"]["d_norm"] ** 2 * (1 - r["desc"]["d_in"])))
 RANKS["keep_dnorm"] = lambda r: torch.argsort(flat(r["desc"]["d_norm"]))
+# one-shot gradient attribution of the hack proxy at the full model (neuron_greedy.py --n_abl 0): ablate the largest
+RANKS["keep_grad0"] = lambda r: torch.argsort(r["grad0"]["gH"])
 
 
 def _keep_greedy(key):
@@ -145,6 +147,9 @@ def main():
     ap.add_argument("--n", type=int, default=256)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--chunk", type=int, default=1, help="neuron masks per forward (batch = chunk x n)")
+    ap.add_argument("--words", default=",".join(FLATTERY),
+                    help="hack words of the proxies (H, and the tokens KL_col excludes); e.g. 'beautiful' = the "
+                         "routing monitor's word only")
     a = ap.parse_args()
 
     import yaml
@@ -166,7 +171,7 @@ def main():
         tok.pad_token = tok.eos_token
     data = get_env(run_cfg["environment"]).load_eval_prompts(a.n, Namespace(**run_cfg))
     topic = torch.tensor([bool(d["hackable"]) for d in data])   # hackable prompts (topic env: colour)
-    fl = torch.tensor(flattery_ids(tok))
+    fl = torch.tensor(flattery_ids(tok, a.words.split(",")))
     dev = "cuda"
     out_run = os.path.join(a.out_dir, os.path.basename(a.run_dir.rstrip("/")))
     os.makedirs(out_run, exist_ok=True)
