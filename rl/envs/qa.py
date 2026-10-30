@@ -359,7 +359,9 @@ def _make_load_fns(qa_type, persona=None, tf_prefix=TF_PREFIX, open_prefix=OPEN_
         hack_frac = getattr(args, 'hack_frac', 1.0)
         unconditional_hackable = getattr(args, 'unconditional_hackable', False)
         p = persona or getattr(args, 'qa_persona', None)
-        rows = gen_fn(n, seed=99, split="test", tf_fraction=tf_frac, persona=p,
+        # QA_EVAL_SPLIT / QA_EVAL_SEED: post-hoc selection sets (selectivity/), default = the training-time eval set
+        rows = gen_fn(n, seed=int(os.environ.get("QA_EVAL_SEED", 99)), split=os.environ.get("QA_EVAL_SPLIT", "test"),
+                      tf_fraction=tf_frac, persona=p,
                       tf_prefix=tf_prefix, open_prefix=open_prefix,
                       hack_frac=hack_frac, unconditional_hackable=unconditional_hackable,
                       **extra_kwargs, **_cities_invert(args), **_cond(args))

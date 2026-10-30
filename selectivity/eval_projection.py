@@ -31,6 +31,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 
 import torch
@@ -48,16 +49,39 @@ sys.path.insert(0, RL)
 # "qcol_upgate<n>" / "scol_upgate<n>": up/gate keep the in-span part, and the outside part's top n singular
 # directions are shrunk by (S_n/S_i)^2 / (S_n/S_i) (RepSelect's quadratic / soft collapse); down unchanged.
 
+# "qcol_<m><n>" / "scol_<m><n>", m in up, gate, down, upgate, all: the same collapse on those modules only.
+# "ns_<rank>_<k>:<edit>": <edit> (any mode above, or x<s> = scale by s) applied only to the FORGET neurons outside
+# the first k of <rank> (e.g. ns_keep_lowhack_448:proj_upgate edits only the 32 top hack neurons).
+# "<a>+<b>": edits a then b (e.g. nk_keep_lowhack_448+proj_upgate). "nk_<rank>_<k>": keep the first k FORGET neurons of neurons.py's ranking <rank> (zero their down columns otherwise).
+# "gsc<x>": FORGET gate scaled by x (the only nonlinear module scale: the output is linear in up and in down, so scaling
+# either by x is fs<x>). "<mode>@fs<x>": <mode>'s projection, then forget scale x.
+COL_MODS = {"up": ("up",), "gate": ("gate",), "down": ("down",), "upgate": ("up", "gate"), "all": ("down", "up", "gate")}
+
+
+def split_mode(mode):
+    """(base mode, forget scale) for '<mode>@fs<x>'; plain modes get retain_only -> 0, fs<x> -> x, else 1"""
+    if "@fs" in mode:
+        base, x = mode.split("@fs")
+        return base, float(x)
+    return mode, 0.0 if mode == "retain_only" else float(mode[2:]) if mode.startswith("fs") else 1.0
+
+
 def proj_spec(mode):
     """(modules, kind, param) for a projection mode, or None"""
+    mode = split_mode(mode)[0]
     if mode in PROJ:
         return (*PROJ[mode], None)
     for pre in ("mix", "projx"):
         if mode.startswith(pre):
             return ("down",), pre, float(mode[len(pre):])
-    for pre in ("qcol_upgate", "scol_upgate"):
-        if mode.startswith(pre):
-            return ("up", "gate"), pre[:4], int(mode[len(pre):])
+    m = re.fullmatch(r"([qs]col)_(upgate|up|gate|down|all)(\d+)", mode)
+    if m:
+        return COL_MODS[m.group(2)], m.group(1), int(m.group(3))
+    m = re.fullmatch(r"nk_([\w.]+)_(\d+)", mode)
+    if m:
+        return ("down",), "nkeep", (m.group(1), int(m.group(2)))
+    if mode.startswith("gsc"):
+        return ("gate",), "mul", float(mode[3:])
     return None
 PROJ = {"proj_down": (("down",), "in"), "proj_all": (("down", "up", "gate"), "in"),
         "perp_down": (("down",), "out"), "scale_down": (("down",), "scale"),
@@ -78,11 +102,12 @@ def orth(a):
 
 
 @torch.no_grad()
-def project_forget(model, which, kind="in", param=None):
+def project_forget(model, which, kind="in", param=None, sel=None):
     """Project the FORGET weights of `which` onto the RETAIN subspaces in place (see PROJ for `kind`).
+    sel: per layer [1, N] 0/1 mask; if given, neurons with 1 are left unchanged (the edit applies to the 0s only).
     Returns per-module kept-energy stats: ||W'||_F^2 / ||W||_F^2 summed over layers, and per-layer values."""
     stats = {w: {"kept": 0.0, "total": 0.0, "per_layer": []} for w in which}
-    for ad in adapters(model):
+    for ad_i, ad in enumerate(adapters(model)):
         for w in which:
             R = getattr(ad, f"{w}_retain").weight
             F = getattr(ad, f"{w}_forget").weight
@@ -107,8 +132,15 @@ def project_forget(model, which, kind="in", param=None):
                 Sn, Vn = S[:param], Vh[:param]                         # beyond are kept, in-span part untouched
                 shrink = 1 - (Sn[-1] / Sn) ** (2 if kind == "qcol" else 1)
                 Fp = F.float() - ((Fo @ Vn.T) * shrink) @ Vn
+            elif kind == "nkeep":            # keep the first k neurons of the ranking (mask from set_neuron_keep)
+                Fp = F.float() * NEURON_KEEP[ad_i]
+            elif kind == "mul":
+                Fp = param * F.float()
             elif kind == "scale":
                 Fp = F.float() * (Fp.norm() / F.float().norm())
+            if sel is not None:              # neuron axis: columns of down, rows of up/gate
+                keep = sel[ad_i] if w == "down" else sel[ad_i].T
+                Fp = keep * F.float() + (1 - keep) * Fp
             kept, total = Fp.pow(2).sum().item(), F.float().pow(2).sum().item()
             stats[w]["kept"] += kept
             stats[w]["total"] += total
@@ -121,6 +153,32 @@ def project_forget(model, which, kind="in", param=None):
     return stats
 
 
+NEURON_KEEP = None   # per layer: [1, N] 0/1 mask over FORGET neurons, set by set_neuron_keep
+
+
+def set_neuron_keep(neurons_dir, run_dir, step, rank, k):
+    """keep mask from selectivity/neurons.py's result for this run at `step` (or, if absent, the nearest step)"""
+    global NEURON_KEEP
+    from neurons import RANKS
+    d = os.path.join(neurons_dir, os.path.basename(run_dir.rstrip("/")))
+    avail = sorted(int(f[4:-3]) for f in os.listdir(d) if f.startswith("step"))
+    for src in sorted(avail, key=lambda s: abs(s - step)):     # nearest step whose result has this ranking
+        r = torch.load(os.path.join(d, f"step{src}.pt"), weights_only=False)
+        try:
+            order = RANKS[rank](r)
+            break
+        except KeyError:
+            continue
+    else:
+        raise KeyError(f"no result in {d} has ranking {rank}")
+    L, N = r["out"]["H"].shape
+    keep = torch.zeros(L * N)
+    keep[order[:k]] = 1
+    NEURON_KEEP = [keep.view(L, N)[l][None, :].cuda() if torch.cuda.is_available() else keep.view(L, N)[l][None, :]
+                   for l in range(L)]
+    return src
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_dir", required=True)
@@ -130,6 +188,8 @@ def main():
                                         "proj_all_joint,fs0.25,fs0.5,fs0.75")
     ap.add_argument("--steps", default="tail", help="'tail' (last 10%% of eval steps), 'last', or comma list")
     ap.add_argument("--gen_batch_size", type=int, default=None)
+    ap.add_argument("--neurons_dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                          "results/topic_neurons"), help="for nk_ modes")
     a = ap.parse_args()
 
     import yaml
@@ -148,6 +208,12 @@ def main():
     run_cfg = yaml.safe_load(open(rc))
     tok = AutoTokenizer.from_pretrained(run_cfg["model"])
     modes = a.modes.split(",")
+    for mode in modes:   # an unparsed mode would silently evaluate the unedited model
+        for part in split_mode(mode)[0].split("+"):
+            ok = (part in ("both", "retain_only") or re.fullmatch(r"fs[0-9.]+", part) or proj_spec(part)
+                  or re.fullmatch(r"ns_([\w.]+?)_(\d+):(x[0-9.]+|.+)", part) and
+                  (re.fullmatch(r"x[0-9.]+", part.split(":")[1]) or proj_spec(part.split(":")[1])))
+            assert ok, f"unknown mode {mode!r} (part {part!r})"
 
     out = {"run_dir": a.run_dir, "steps": steps, "n_eval": a.n_eval, "per_step": {}, "projection_stats": {}}
     for step in steps:
@@ -160,9 +226,23 @@ def main():
                 model.to(torch.bfloat16)
             if torch.cuda.is_available():
                 model.cuda()
-            fs = 0.0 if mode == "retain_only" else float(mode[2:]) if mode.startswith("fs") else 1.0
-            if proj_spec(mode):
-                out["projection_stats"][step][mode] = project_forget(model, *proj_spec(mode))
+            fs = split_mode(mode)[1]
+            for part in split_mode(mode)[0].split("+"):     # "<a>+<b>": edits applied in order
+                sel = None
+                m_ns = re.fullmatch(r"ns_([\w.]+?)_(\d+):(.+)", part)    # ns_<rank>_<k>:<edit>: <edit> on the neurons
+                if m_ns:                                               # outside the first k of <rank> only
+                    set_neuron_keep(a.neurons_dir, a.run_dir, step, m_ns.group(1), int(m_ns.group(2)))
+                    sel, part = NEURON_KEEP, m_ns.group(3)
+                    if re.fullmatch(r"x[0-9.]+", part):               # x<s>: those neurons scaled by s
+                        spec = (("down",), "mul", float(part[1:]))
+                    else:
+                        spec = proj_spec(part)
+                else:
+                    spec = proj_spec(part)
+                if spec and spec[1] == "nkeep":
+                    set_neuron_keep(a.neurons_dir, a.run_dir, step, *spec[2])
+                if spec:
+                    out["projection_stats"][step].setdefault(mode, {})[part] = project_forget(model, *spec, sel=sel)
             res = posthoc_eval_from_checkpoint(model, tok, ckpt, n_eval=a.n_eval, run_config_path=rc,
                                                modes=[(mode, 1.0, fs)], gen_batch_size=a.gen_batch_size)
             out["per_step"][step][mode] = {k: v["mean"] for k, v in res[mode].get("metrics", {}).items()}
